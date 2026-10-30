@@ -16,6 +16,10 @@ const MAX_FAILS = 5;
 const LOCK_MIN = 15;
 const STATUSES = ["new", "research", "qualified", "contacted", "meeting", "not_relevant", "in_crm"];
 const TOUCH_CHANNELS = ["call", "email", "linkedin", "messenger", "meeting", "visit", "note"];
+const PRIORITIES = ["A", "B", "C", "partner"];
+const ICP_VALUES = ["yes", "no", "check"];
+const CLOSED = ["not_relevant", "in_crm"];
+const INVITES = ["sent", "accepted", "declined"];
 
 const CORS = {
   "access-control-allow-origin": "*",
@@ -229,6 +233,46 @@ function decodeBase64(s: string) {
   return unb64(s.replace(/^data:.*?;base64,/, "").replace(/\s/g, ""));
 }
 
+// ---------- crediting ----------
+// A company is credited when all seven conditions hold. app.js mirrors them in creditChecks(); keep both in step.
+type Touch = { channel: string; meaningful: boolean; outcome: string | null; next_step: string | null; next_date: string | null };
+function creditMet(work: Record<string, unknown> | null, contacts: { relevant: boolean }[], touches: Touch[]) {
+  const real = touches.filter((t) => t.meaningful && t.channel !== "note");
+  const last = touches[0];
+  return work?.icp === "yes"
+    && contacts.filter((c) => c.relevant).length >= 2
+    && real.length >= 3
+    && new Set(real.map((t) => t.channel)).size >= 2
+    && real.some((t) => !!t.outcome)
+    && (CLOSED.includes(String(work?.status)) || !!(last?.next_step && last?.next_date))
+    && !!work?.proof;
+}
+
+// Stamps the crediting date the first time the conditions hold and clears it if they stop holding.
+async function recomputeCredit(krs: string) {
+  const [{ data: w }, { data: cs }, { data: ts }] = await Promise.all([
+    db.from("krs_work").select("*").eq("krs", krs).maybeSingle(),
+    db.from("krs_contacts").select("relevant").eq("krs", krs),
+    db.from("krs_touches").select("channel, meaningful, outcome, next_step, next_date")
+      .eq("krs", krs).order("touched_at", { ascending: false }).order("id", { ascending: false }),
+  ]);
+  if (!w) return null;
+  const met = creditMet(w, cs ?? [], (ts ?? []) as Touch[]);
+  let credited = w.credited_at;
+  if (met && !credited) credited = new Date().toISOString().slice(0, 10);
+  else if (!met && credited) credited = null;
+  if (credited !== w.credited_at) await db.from("krs_work").update({ credited_at: credited }).eq("krs", krs);
+  return { ...w, credited_at: credited };
+}
+
+const cut = (v: unknown, n: number) => (v == null || String(v).trim() === "" ? null : String(v).trim().slice(0, n));
+const isKrs = (k: unknown) => /^\d{10}$/.test(String(k ?? ""));
+
+async function readCycle() {
+  const { data } = await db.from("dash_settings").select("value").eq("key", "cycle").maybeSingle();
+  try { return data ? JSON.parse(data.value) : null; } catch { return null; }
+}
+
 // ---------- handlers ----------
 async function handle(req: Request) {
   // Hourly sync: raw xlsx body + x-ingest-key header.
@@ -289,12 +333,15 @@ async function handle(req: Request) {
   if (user.must_change) throw new HttpError(403, "Спершу змініть пароль");
 
   if (action === "data") {
-    const [{ data: companies }, { data: work }, { data: users }, { data: syncs }, { data: touches }] = await Promise.all([
+    const [{ data: companies }, { data: work }, { data: users }, { data: syncs }, { data: touches }, { data: contacts }, cycle] = await Promise.all([
       db.from("krs_companies").select("krs, data, source_sheet, first_seen_at, updated_at"),
       db.from("krs_work").select("*"),
-      db.from("dash_users").select("username, display_name").eq("disabled", false),
+      db.from("dash_users").select("id, username, display_name").eq("disabled", false).order("created_at"),
       db.from("krs_sync_log").select("at, source, total, inserted, updated").order("at", { ascending: false }).limit(1),
-      db.from("krs_touches").select("krs, touched_at, channel, summary, next_step, next_date, author").order("touched_at", { ascending: false }),
+      db.from("krs_touches").select("id, krs, touched_at, channel, summary, outcome, next_step, next_date, author, author_id, meaningful, warm, discovery, qualified")
+        .order("touched_at", { ascending: false }).order("id", { ascending: false }),
+      db.from("krs_contacts").select("krs, relevant"),
+      readCycle(),
     ]);
     const w = new Map((work ?? []).map((x) => [x.krs, x]));
     // Per company: count, the latest touch, and the next step set by that latest touch.
@@ -304,25 +351,53 @@ async function handle(req: Request) {
       if (cur) cur.count++;
       else t.set(x.krs, { count: 1, last: x });
     }
+    const dm = new Map<string, { total: number; relevant: number }>();
+    for (const x of contacts ?? []) {
+      const cur = dm.get(x.krs) ?? { total: 0, relevant: 0 };
+      cur.total++;
+      if (x.relevant) cur.relevant++;
+      dm.set(x.krs, cur);
+    }
     return {
-      companies: (companies ?? []).map((c) => ({ ...c, work: w.get(c.krs) ?? null, touches: t.get(c.krs) ?? null })),
+      companies: (companies ?? []).map((c) => ({ ...c, work: w.get(c.krs) ?? null, touches: t.get(c.krs) ?? null, contacts: dm.get(c.krs) ?? null })),
       team: (users ?? []).map((u) => u.display_name || u.username),
+      team_users: (users ?? []).map((u) => ({ id: u.id, name: u.display_name || u.username })),
+      // Compact log of every touch for the cycle metrics; texts stay in the per-company call.
+      touch_log: (touches ?? []).map((x) => ({
+        krs: x.krs, at: x.touched_at, ch: x.channel, au: x.author, auid: x.author_id,
+        m: x.meaningful && x.channel !== "note", w: x.warm, d: x.discovery, q: x.qualified, o: x.outcome,
+      })),
+      cycle,
       last_sync: syncs?.[0] ?? null,
     };
   }
 
   if (action === "set_work") {
     const krs = String(body.krs ?? "");
-    if (!/^\d{10}$/.test(krs)) throw new HttpError(400, "Невірний KRS");
+    if (!isKrs(krs)) throw new HttpError(400, "Невірний KRS");
     const patch: Record<string, unknown> = { krs, updated_by: user.display_name || user.username, updated_at: new Date().toISOString() };
     if (body.status !== undefined) {
       if (!STATUSES.includes(body.status)) throw new HttpError(400, "Невірний статус");
       patch.status = body.status;
     }
-    for (const k of ["owner", "priority", "note"]) if (body[k] !== undefined) patch[k] = body[k] === "" ? null : String(body[k]).slice(0, 4000);
-    const { data, error } = await db.from("krs_work").upsert(patch, { onConflict: "krs" }).select().single();
+    if (body.priority !== undefined) {
+      if (body.priority !== "" && !PRIORITIES.includes(body.priority)) throw new HttpError(400, "Невірний пріоритет");
+      patch.priority = body.priority || null;
+    }
+    if (body.icp !== undefined) {
+      if (body.icp !== "" && !ICP_VALUES.includes(body.icp)) throw new HttpError(400, "Невірне значення ICP");
+      patch.icp = body.icp || null;
+    }
+    if (body.cycle_month !== undefined) {
+      const m = body.cycle_month === "" || body.cycle_month == null ? null : Number(body.cycle_month);
+      if (m !== null && ![1, 2, 3].includes(m)) throw new HttpError(400, "Місяць циклу: 1, 2 або 3");
+      patch.cycle_month = m;
+    }
+    for (const k of ["owner", "segment"]) if (body[k] !== undefined) patch[k] = cut(body[k], 120);
+    for (const k of ["note", "blocker", "proof"]) if (body[k] !== undefined) patch[k] = cut(body[k], 4000);
+    const { error } = await db.from("krs_work").upsert(patch, { onConflict: "krs" });
     if (error) throw new HttpError(500, error.message);
-    return { work: data };
+    return { work: await recomputeCredit(krs) };
   }
 
   if (action === "touches") {
@@ -331,9 +406,48 @@ async function handle(req: Request) {
     return { touches: data ?? [] };
   }
 
+  if (action === "contacts") {
+    const { data } = await db.from("krs_contacts").select("*").eq("krs", String(body.krs ?? "")).order("created_at");
+    return { contacts: data ?? [] };
+  }
+
+  if (action === "save_contact") {
+    const krs = String(body.krs ?? "");
+    if (!isKrs(krs)) throw new HttpError(400, "Невірний KRS");
+    const fullName = cut(body.full_name, 160);
+    if (!fullName) throw new HttpError(400, "Вкажіть ім'я контакту");
+    const linkedin = cut(body.linkedin, 300);
+    if (linkedin && !/^https?:\/\//i.test(linkedin)) throw new HttpError(400, "LinkedIn: повне посилання з https://");
+    const row: Record<string, unknown> = {
+      krs, full_name: fullName, position: cut(body.position, 160), relevant: body.relevant !== false,
+      email: cut(body.email, 200), phone: cut(body.phone, 60), linkedin, language: cut(body.language, 20),
+      source: cut(body.source, 160), invite: INVITES.includes(body.invite) ? body.invite : null, note: cut(body.note, 2000),
+      updated_at: new Date().toISOString(),
+    };
+    if (body.id) {
+      const { data: old } = await db.from("krs_contacts").select("krs").eq("id", Number(body.id)).maybeSingle();
+      if (!old || old.krs !== krs) throw new HttpError(404, "Контакт не знайдено");
+      await db.from("krs_contacts").update(row).eq("id", Number(body.id));
+      // Touches show the contact by name, so keep the name in step.
+      await db.from("krs_touches").update({ contact: fullName }).eq("contact_id", Number(body.id));
+    } else {
+      const { error } = await db.from("krs_contacts").insert({ ...row, created_by: user.display_name || user.username, created_by_id: user.id });
+      if (error) throw new HttpError(500, error.message);
+    }
+    return { work: await recomputeCredit(krs) };
+  }
+
+  if (action === "delete_contact") {
+    const { data: ct } = await db.from("krs_contacts").select("krs, created_by_id").eq("id", Number(body.id)).maybeSingle();
+    if (!ct) throw new HttpError(404, "Контакт не знайдено");
+    if (ct.created_by_id !== user.id && user.role !== "admin") throw new HttpError(403, "Видаляти можна лише власні контакти");
+    await db.from("krs_contacts").delete().eq("id", Number(body.id));
+    return { work: await recomputeCredit(ct.krs) };
+  }
+
   if (action === "add_touch") {
     const krs = String(body.krs ?? "");
-    if (!/^\d{10}$/.test(krs)) throw new HttpError(400, "Невірний KRS");
+    if (!isKrs(krs)) throw new HttpError(400, "Невірний KRS");
     const summary = String(body.summary ?? "").trim();
     if (!summary) throw new HttpError(400, "Опишіть, що було під час дотику");
     const channel = TOUCH_CHANNELS.includes(body.channel) ? body.channel : "note";
@@ -341,24 +455,31 @@ async function handle(req: Request) {
     if (isNaN(touchedAt.getTime()) || touchedAt.getTime() > Date.now() + 86400000) throw new HttpError(400, "Невірна дата дотику");
     const nextDate = body.next_date ? String(body.next_date) : null;
     if (nextDate && !/^\d{4}-\d{2}-\d{2}$/.test(nextDate)) throw new HttpError(400, "Невірна дата наступного кроку");
-    const cut = (v: unknown, n: number) => (v == null || v === "" ? null : String(v).slice(0, n));
+    let contactId: number | null = null, contactName = cut(body.contact, 200);
+    if (body.contact_id) {
+      const { data: ct } = await db.from("krs_contacts").select("id, krs, full_name").eq("id", Number(body.contact_id)).maybeSingle();
+      if (!ct || ct.krs !== krs) throw new HttpError(400, "Контакт не належить цій компанії");
+      contactId = ct.id; contactName = ct.full_name;
+    }
+    const meaningful = channel !== "note" && body.meaningful !== false;
     const { data, error } = await db.from("krs_touches").insert({
       krs, channel, touched_at: touchedAt.toISOString(),
       direction: body.direction === "in" || body.direction === "out" ? body.direction : null,
-      contact: cut(body.contact, 200), summary: summary.slice(0, 4000), outcome: cut(body.outcome, 40),
+      contact: contactName, contact_id: contactId, summary: summary.slice(0, 4000), outcome: cut(body.outcome, 40),
       next_step: cut(body.next_step, 1000), next_date: nextDate,
+      meaningful, warm: meaningful && !!body.warm, discovery: meaningful && !!body.discovery, qualified: meaningful && !!body.qualified,
       author: user.display_name || user.username, author_id: user.id,
     }).select().single();
     if (error) throw new HttpError(500, error.message);
-    return { touch: data };
+    return { touch: data, work: await recomputeCredit(krs) };
   }
 
   if (action === "delete_touch") {
-    const { data: t } = await db.from("krs_touches").select("author_id").eq("id", Number(body.id)).maybeSingle();
+    const { data: t } = await db.from("krs_touches").select("krs, author_id").eq("id", Number(body.id)).maybeSingle();
     if (!t) throw new HttpError(404, "Запис не знайдено");
     if (t.author_id !== user.id && user.role !== "admin") throw new HttpError(403, "Видаляти можна лише власні записи");
     await db.from("krs_touches").delete().eq("id", Number(body.id));
-    return { ok: true };
+    return { ok: true, work: await recomputeCredit(t.krs) };
   }
 
   // ---------- admin ----------
@@ -419,6 +540,20 @@ async function handle(req: Request) {
     if (body.id === user.id) throw new HttpError(400, "Не можна видалити себе");
     await db.from("dash_users").delete().eq("id", String(body.id ?? ""));
     return { ok: true };
+  }
+
+  if (action === "set_cycle") {
+    const iso = /^\d{4}-\d{2}-\d{2}$/;
+    if (!iso.test(body.start ?? "") || !iso.test(body.end ?? "") || body.start > body.end) throw new HttpError(400, "Перевірте межі циклу");
+    const num = (v: unknown) => Math.max(0, Math.min(100000, Math.round(Number(v) || 0)));
+    const targets: Record<string, number> = {};
+    for (const k of ["companies", "touches", "warm", "discovery", "qualified", "credited"]) targets[k] = num(body.targets?.[k]);
+    const { data: ids } = await db.from("dash_users").select("id");
+    const plan: Record<string, number> = {};
+    for (const { id } of ids ?? []) if (body.plan?.[id] !== undefined) plan[id] = num(body.plan[id]);
+    const cycle = { start: body.start, end: body.end, targets, plan };
+    await db.from("dash_settings").upsert({ key: "cycle", value: JSON.stringify(cycle) });
+    return { cycle };
   }
 
   if (action === "sync_log") {

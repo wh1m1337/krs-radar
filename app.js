@@ -15,7 +15,17 @@ const STATUS = {
   not_relevant: "Не релевантно",
   in_crm: "Передано в CRM",
 };
-const PRIORITY = { high: "Високий", normal: "Звичайний", low: "Низький" };
+const PRIORITY = { A: "A", B: "B", C: "C", partner: "Партнер / канал" };
+const ICP = { yes: "Так", no: "Ні", check: "Уточнити" };
+const SEGMENTS = [
+  "Виробництво / промисловість", "Харчова промисловість / FMCG", "Логістика і транспорт", "Роздріб / e-commerce", "HoReCa",
+  "Будівництво / нерухомість", "Медицина", "Освіта", "Професійні послуги", "Краса / велнес", "Енергетика / трейдинг",
+  "Держава / інституції", "Медіа / фінтех", "Оборонка", "IT / аутсорсинг", "IT-продукт / SaaS", "IT-інфраструктура", "Інше",
+];
+const INVITE = { sent: "Запрошення надіслано", accepted: "Запрошення прийнято", declined: "Запрошення відхилено" };
+const LANGS = ["UA", "PL", "EN", "UA/PL", "UA/EN"];
+const CLOSED = ["not_relevant", "in_crm"];
+const TOUCH_FLAGS = { warm: "Теплий", discovery: "Discovery", qualified: "Кваліфіковано" };
 const CHANNELS = { call: "Дзвінок", email: "Email", linkedin: "LinkedIn", messenger: "Месенджер", meeting: "Зустріч", visit: "Візит", note: "Нотатка" };
 const OUTCOMES = {
   no_answer: "Без відповіді", interested: "Зацікавлені", follow_up: "Повернутися пізніше", meeting_set: "Призначено зустріч",
@@ -76,6 +86,10 @@ const state = {
   view: "overview",
   data: [],
   team: [],
+  teamUsers: [],
+  touchLog: [],
+  touchAgg: new Map(),
+  cycle: null,
   lastSync: null,
   loadedAt: null,
   filters: defaultFilters(),
@@ -86,7 +100,7 @@ const state = {
 };
 
 function defaultFilters() {
-  return { q: "", fit: [], voiv: [], sector: [], status: [], owner: [], from: "", to: "", flags: [], showRemoved: false };
+  return { q: "", fit: [], voiv: [], sector: [], status: [], owner: [], prio: [], segment: [], from: "", to: "", flags: [], showRemoved: false };
 }
 
 // ---------- utils ----------
@@ -206,6 +220,16 @@ function enrich(row) {
     owner: row.work?.owner || "",
     touchCount: row.touches?.count || 0,
     lastTouch: row.touches?.last || null,
+    priority: row.work?.priority || "",
+    segment: row.work?.segment || "",
+    icp: row.work?.icp || "",
+    cycleMonth: row.work?.cycle_month || null,
+    blocker: row.work?.blocker || "",
+    proof: row.work?.proof || "",
+    credited: row.work?.credited_at || null,
+    dmCount: row.contacts?.relevant || 0,
+    contactCount: row.contacts?.total || 0,
+    agg: state.touchAgg.get(row.krs) || { m: 0, ch: 0, outcome: false },
   };
   c.age = daysSince(c.reg);
   c.nextDate = c.lastTouch?.next_date || null;
@@ -214,9 +238,39 @@ function enrich(row) {
   c.it = c.sector === "IT та програмування";
   c.score = scoreOf(c);
   c.fit = levelOf(c.score.total);
+  c.checks = creditChecks(c);
+  c.missing = c.checks.filter((x) => !x[1]).map((x) => x[2]);
   c.search = [c.krs, d.name, d.nip, d.regon, d.city, d.voivodeship, d.ua_owner, d.dm, d.pkd_main, d.activity, d.products, d.it_needs, d.rationale, d.next_step, c.lastTouch?.summary, c.lastTouch?.next_step]
     .filter(Boolean).join(" ").toLowerCase();
   return c;
+}
+
+// The seven crediting conditions. The krs-api function stamps credited_at from the same list (creditMet); keep both in step.
+function creditChecks(c) {
+  const a = c.agg;
+  const next = CLOSED.includes(c.status) || !!(c.lastTouch?.next_step && c.lastTouch?.next_date);
+  return [
+    ["ICP = Так", c.icp === "yes", "ICP"],
+    ["Щонайменше 2 релевантні ЛПР", c.dmCount >= 2, `додати ЛПР (${c.dmCount}/2)`],
+    ["Щонайменше 3 змістовні дотики", a.m >= 3, `ще ${Math.max(0, 3 - a.m)} дотик(и)`],
+    ["Щонайменше 2 різні канали", a.ch >= 2, "додати канал"],
+    ["Зафіксований результат дотику", a.outcome, "результат"],
+    ["Наступна дія з датою або компанію закрито", next, "наступна дія і дата"],
+    ["Є підтвердження / посилання", !!c.proof, "підтвердження"],
+  ];
+}
+
+// Per company: meaningful touches, distinct channels among them, whether any has an outcome.
+function touchAggregates(log) {
+  const m = new Map();
+  for (const t of log) {
+    if (!t.m) continue;
+    const a = m.get(t.krs) || { m: 0, chans: new Set(), outcome: false };
+    a.m++; a.chans.add(t.ch); if (t.o) a.outcome = true;
+    m.set(t.krs, a);
+  }
+  for (const a of m.values()) a.ch = a.chans.size;
+  return m;
 }
 
 // ---------- filtering ----------
@@ -232,6 +286,17 @@ const FLAGS = {
   notouch: { label: "Без дотиків", test: (c) => !c.touchCount },
   overdue: { label: "Прострочений наступний крок", test: (c) => c.overdue },
   mine: { label: "Мої", test: (c) => c.owner && c.owner === (state.user.display_name || state.user.username) },
+  inplan: { label: "У плані циклу", test: (c) => !!c.cycleMonth },
+  credited: { label: "Зараховано", test: (c) => !!c.credited },
+  blocker: { label: "Є блокер", test: (c) => !!c.blocker },
+  // Data-quality checks, reached from the cycle page; shown only while active.
+  noowner: { label: "Без відповідального", hidden: true, test: (c) => !c.owner },
+  noicp: { label: "ICP не підтверджено", hidden: true, test: (c) => c.icp !== "yes" },
+  lt2dm: { label: "Менше 2 ЛПР", hidden: true, test: (c) => c.dmCount < 2 },
+  lt3: { label: "Менше 3 змістовних дотиків", hidden: true, test: (c) => c.agg.m < 3 },
+  lt2ch: { label: "Менше 2 каналів", hidden: true, test: (c) => c.agg.ch < 2 },
+  nonext: { label: "Немає наступної дії з датою", hidden: true, test: (c) => !c.checks[5][1] },
+  noproof: { label: "Немає підтвердження", hidden: true, test: (c) => !c.proof },
 };
 
 function applyFilters(list, f, skip) {
@@ -244,6 +309,8 @@ function applyFilters(list, f, skip) {
     if (skip !== "sector" && f.sector.length && !f.sector.includes(c.sector)) return false;
     if (skip !== "status" && f.status.length && !f.status.includes(c.status)) return false;
     if (skip !== "owner" && f.owner.length && !f.owner.includes(c.owner || "—")) return false;
+    if (skip !== "prio" && f.prio.length && !f.prio.includes(c.priority || "—")) return false;
+    if (skip !== "segment" && f.segment.length && !f.segment.includes(c.segment || "—")) return false;
     if (f.from && (!c.reg || c.reg < f.from)) return false;
     if (f.to && (!c.reg || c.reg > f.to)) return false;
     for (const fl of f.flags) if (FLAGS[fl] && !FLAGS[fl].test(c)) return false;
@@ -284,7 +351,7 @@ function writeHash() {
   const f = state.filters;
   const p = new URLSearchParams();
   p.set("v", state.view);
-  for (const k of ["fit", "voiv", "sector", "status", "owner", "flags"]) if (f[k].length) p.set(k, f[k].join("~"));
+  for (const k of ["fit", "voiv", "sector", "status", "owner", "prio", "segment", "flags"]) if (f[k].length) p.set(k, f[k].join("~"));
   for (const k of ["q", "from", "to"]) if (f[k]) p.set(k, f[k]);
   if (f.showRemoved) p.set("removed", "1");
   if (state.sort.key !== "score" || state.sort.dir !== -1) p.set("sort", `${state.sort.key}.${state.sort.dir}`);
@@ -295,11 +362,11 @@ function writeHash() {
 function readHash() {
   const p = new URLSearchParams(location.hash.slice(1));
   const f = defaultFilters();
-  for (const k of ["fit", "voiv", "sector", "status", "owner", "flags"]) if (p.get(k)) f[k] = p.get(k).split("~");
+  for (const k of ["fit", "voiv", "sector", "status", "owner", "prio", "segment", "flags"]) if (p.get(k)) f[k] = p.get(k).split("~");
   for (const k of ["q", "from", "to"]) if (p.get(k)) f[k] = p.get(k);
   f.showRemoved = p.get("removed") === "1";
   state.filters = f;
-  if (["overview", "companies", "admin"].includes(p.get("v"))) state.view = p.get("v");
+  if (["overview", "companies", "cycle", "admin"].includes(p.get("v"))) state.view = p.get("v");
   if (p.get("sort")) { const [k, d] = p.get("sort").split("."); if (SORTS[k]) state.sort = { key: k, dir: Number(d) || -1 }; }
   state.openKrs = p.get("krs") || null;
 }
@@ -405,6 +472,10 @@ async function afterAuth() {
 async function loadData(silent) {
   try {
     const r = await api("data");
+    state.touchLog = r.touch_log || [];
+    state.touchAgg = touchAggregates(state.touchLog);
+    state.cycle = r.cycle;
+    state.teamUsers = r.team_users || [];
     state.data = r.companies.map(enrich);
     state.team = r.team;
     state.lastSync = r.last_sync;
@@ -427,6 +498,7 @@ function renderShell() {
       <nav class="tabs" id="tabs">
         <button class="tab" data-v="overview">Огляд</button>
         <button class="tab" data-v="companies">Компанії</button>
+        <button class="tab" data-v="cycle">Цикл</button>
         ${u.role === "admin" ? `<button class="tab" data-v="admin">Адміністрування</button>` : ""}
       </nav>
       <div class="top-right">
@@ -448,6 +520,7 @@ function renderShell() {
 const HERO = {
   overview: ["Нові компанії", "з українськими власниками", "Реєстри KRS і CRBR щогодини: хто відкрився в Польщі, де, в якій галузі і наскільки підходить під наш профіль."],
   companies: ["Компанії", "фільтри, оцінка й робота команди", "Відкрийте картку, щоб побачити реєстрові дані, джерела й історію дотиків."],
+  cycle: ["Цикл продажів", "цілі, план і якість даних", "Показники за тиждень, місяць і весь цикл рахуються з історії дотиків. Клік по рядку відкриває відфільтрований список компаній."],
   admin: ["Адміністрування", "акаунти й синхронізація", "Додавайте колег, скидайте паролі, стежте за імпортом бази."],
 };
 
@@ -481,6 +554,7 @@ function renderView() {
   if (!state.user) return;
   if (state.view === "overview") renderOverview();
   else if (state.view === "companies") renderCompanies();
+  else if (state.view === "cycle") renderCycle();
   else if (state.view === "admin") renderAdmin();
 }
 
@@ -633,7 +707,9 @@ function renderCompanies() {
   const list = sorted(applyFilters(base, f));
   const fc = (key, fn) => countBy(applyFilters(base, f, key), fn);
   const activeChips = [];
-  for (const k of ["fit", "voiv", "sector", "owner"]) for (const v of f[k]) activeChips.push([k, v, k === "voiv" ? titleCase(v) : v]);
+  for (const k of ["fit", "voiv", "sector", "owner", "segment"]) for (const v of f[k]) activeChips.push([k, v, k === "voiv" ? titleCase(v) : v === "—" ? "Без значення" : v]);
+  for (const v of f.prio) activeChips.push(["prio", v, `Пріоритет: ${PRIORITY[v] || "—"}`]);
+  for (const v of f.flags) if (FLAGS[v]?.hidden) activeChips.push(["flags", v, FLAGS[v].label]);
   for (const v of f.status) activeChips.push(["status", v, STATUS[v]]);
   if (f.from || f.to) activeChips.push(["date", "", `Реєстрація ${f.from ? "від " + fmtDate(f.from) : ""} ${f.to ? "до " + fmtDate(f.to) : ""}`]);
 
@@ -650,6 +726,8 @@ function renderCompanies() {
       ${facet("Відповідність", "fit", fc("fit", (c) => c.fit), (x) => x, FIT_ORDER)}
       ${facet("Статус опрацювання", "status", fc("status", (c) => c.status), (x) => STATUS[x] || x, Object.keys(STATUS))}
       ${facet("Відповідальний", "owner", withTeam(fc("owner", (c) => c.owner || "—")), (x) => (x === "—" ? "Не призначено" : x))}
+      ${facet("Пріоритет", "prio", fc("prio", (c) => c.priority || "—"), (x) => PRIORITY[x] || "Не задано", [...Object.keys(PRIORITY), "—"])}
+      ${facet("Сегмент", "segment", fc("segment", (c) => c.segment || "—"), (x) => (x === "—" ? "Не задано" : x))}
       ${facet("Галузь (PKD)", "sector", fc("sector", (c) => c.sector))}
       ${facet("Воєводство", "voiv", fc("voiv", (c) => c.voiv), titleCase)}
       <h4>Інше</h4>
@@ -672,7 +750,7 @@ function renderCompanies() {
         <button class="btn" id="csv">Експорт CSV</button>
       </div>
       <div class="chips">
-        ${Object.entries(FLAGS).map(([k, v]) => `<button class="chip ${f.flags.includes(k) ? "on" : ""}" data-flag="${k}">${esc(v.label)}</button>`).join("")}
+        ${Object.entries(FLAGS).filter(([, v]) => !v.hidden).map(([k, v]) => `<button class="chip ${f.flags.includes(k) ? "on" : ""}" data-flag="${k}">${esc(v.label)}</button>`).join("")}
       </div>
       ${activeChips.length ? `<div class="chips">${activeChips.map(([k, v, l]) => `<button class="chip on x" data-unset="${k}" data-val="${esc(v)}">${esc(l)}</button>`).join("")}</div>` : ""}
       <div class="result-info">Знайдено <b>${list.length}</b> з ${base.filter((c) => f.showRemoved || !c.removed).length}</div>
@@ -735,13 +813,13 @@ function rowFull(c) {
   const owners = c.owners.length ? c.owners.map((o) => `${o.name}${o.pct != null ? ` ${o.pct}%` : ""}`).join(", ") : c.d.ua_owner;
   return `<tr data-open="${c.krs}">
     <td>${scoreBadge(c)}</td>
-    <td><div class="nm">${esc(c.name)} ${c.isNew ? `<span class="badge new">нова</span>` : ""}${c.it ? ` <span class="badge" title="IT-компанія: імовірний партнер або конкурент, не клієнт">партнер/конкурент</span>` : ""} ${c.removed ? `<span class="badge removed">вилучено</span>` : ""}</div>
+    <td><div class="nm">${c.priority ? `<span class="badge prio">${esc(c.priority === "partner" ? "Партнер" : c.priority)}</span> ` : ""}${esc(c.name)} ${c.isNew ? `<span class="badge new">нова</span>` : ""}${c.it ? ` <span class="badge" title="IT-компанія: імовірний партнер або конкурент, не клієнт">партнер/конкурент</span>` : ""} ${c.removed ? `<span class="badge removed">вилучено</span>` : ""}</div>
       <div class="sub">${esc(c.city)}${c.voiv !== "Невідомо" ? `, ${esc(titleCase(c.voiv))}` : ""} · KRS ${esc(c.krs)}${c.site ? ` · <a href="${esc(c.site)}" target="_blank" rel="noopener noreferrer" data-stop>сайт</a>` : ""}</div></td>
     <td class="num">${fmtDate(c.reg)}<div class="sub">${c.age != null ? `${c.age} дн. тому` : ""}</div></td>
     <td class="wrap hide-m"><div class="clip">${esc(c.sector)}${c.pkd ? ` · ${esc(c.pkd)}` : ""}</div><div class="sub clip">${shown(c.d.products || c.d.activity)}</div></td>
     <td class="wrap hide-m"><div class="clip">${esc(owners || "—")}</div>${known(c.d.dm) ? `<div class="sub clip">ЛПР: ${esc(c.d.dm)}</div>` : ""}</td>
     <td>${fitBadge(c.fit)}</td>
-    <td><span class="badge">${esc(STATUS[c.status])}</span>${c.owner ? `<div class="sub">${esc(c.owner)}</div>` : ""}</td>
+    <td><span class="badge">${esc(STATUS[c.status])}</span>${c.credited ? ` <span class="badge hi" title="Зараховано ${esc(fmtDate(c.credited))}">зараховано</span>` : ""}${c.owner ? `<div class="sub">${esc(c.owner)}</div>` : ""}${c.blocker ? `<div class="sub over-t">блокер</div>` : ""}</td>
     <td class="hide-m">${c.lastTouch
       ? `<div class="num">${esc(fmtDate(c.lastTouch.touched_at))} · ${esc(CHANNELS[c.lastTouch.channel] || "")}</div><div class="sub">${c.touchCount} ${plural(c.touchCount, "запис", "записи", "записів")}</div>${c.nextDate ? `<span class="badge ${c.overdue ? "over" : "new"}">далі ${esc(fmtDate(c.nextDate))}</span>` : ""}`
       : `<span class="faint">—</span>`}</td>
@@ -762,7 +840,10 @@ function exportCsv(list) {
     ["ЛПР", (c) => c.d.dm], ["Роль ЛПР", (c) => c.d.dm_role], ["PKD", (c) => c.d.pkd_main], ["Галузь", (c) => c.sector], ["Сайт", (c) => c.site],
     ["B2B/B2C", (c) => c.d.b2b_b2c], ["Відповідність", (c) => c.score.total], ["Рівень", (c) => c.fit], ["Оцінка дослідника (Excel)", (c) => c.d.src_fit], ["Обґрунтування", (c) => c.d.rationale],
     ["Можливі IT-потреби", (c) => c.d.it_needs], ["Наступний крок", (c) => c.d.next_step], ["Статус", (c) => STATUS[c.status]],
-    ["Відповідальний", (c) => c.owner], ["Дотиків", (c) => c.touchCount],
+    ["Відповідальний", (c) => c.owner], ["Пріоритет", (c) => PRIORITY[c.priority]], ["Сегмент", (c) => c.segment], ["ICP", (c) => ICP[c.icp]],
+    ["Місяць циклу", (c) => c.cycleMonth], ["Релевантних ЛПР", (c) => c.dmCount], ["Змістовних дотиків", (c) => c.agg.m], ["Каналів", (c) => c.agg.ch],
+    ["Зараховано", (c) => c.credited], ["Чого не вистачає", (c) => c.missing.join("; ")], ["Блокер", (c) => c.blocker], ["Підтвердження", (c) => c.proof],
+    ["Дотиків", (c) => c.touchCount],
     ["Останній дотик", (c) => c.lastTouch && `${c.lastTouch.touched_at.slice(0, 10)} ${CHANNELS[c.lastTouch.channel] || ""}: ${c.lastTouch.summary}`],
     ["Наступний крок команди", (c) => c.lastTouch?.next_step], ["Дата наступного кроку", (c) => c.nextDate], ["Джерела", (c) => c.d.sources],
   ];
@@ -837,10 +918,53 @@ function openDrawer(krs) {
     <div class="sec">
       <h4>Робота команди <small id="wMsg">${w.updated_by ? `оновив ${esc(w.updated_by)} ${esc(fmtDT(w.updated_at))}` : ""}</small></h4>
       <div class="work-row">
-        <select class="select" id="wStatus" aria-label="Статус">${Object.entries(STATUS).map(([k, l]) => `<option value="${k}" ${c.status === k ? "selected" : ""}>${l}</option>`).join("")}</select>
-        <select class="select" id="wOwner" aria-label="Відповідальний"><option value="">Відповідальний: —</option>${state.team.map((t) => `<option ${w.owner === t ? "selected" : ""}>${esc(t)}</option>`).join("")}</select>
-        <select class="select" id="wPrio" aria-label="Пріоритет"><option value="">Пріоритет: —</option>${Object.entries(PRIORITY).map(([k, l]) => `<option value="${k}" ${w.priority === k ? "selected" : ""}>${l}</option>`).join("")}</select>
+        <label class="mini"><span>Статус</span><select class="select" data-w="status">${Object.entries(STATUS).map(([k, l]) => `<option value="${k}" ${c.status === k ? "selected" : ""}>${l}</option>`).join("")}</select></label>
+        <label class="mini"><span>Відповідальний</span><select class="select" data-w="owner"><option value="">—</option>${state.team.map((t) => `<option ${w.owner === t ? "selected" : ""}>${esc(t)}</option>`).join("")}</select></label>
+        <label class="mini"><span>Пріоритет</span><select class="select" data-w="priority"><option value="">—</option>${Object.entries(PRIORITY).map(([k, l]) => `<option value="${k}" ${c.priority === k ? "selected" : ""}>${esc(l)}</option>`).join("")}</select></label>
+        <label class="mini"><span>Сегмент</span><select class="select" data-w="segment"><option value="">—</option>${[...new Set([...SEGMENTS, ...(c.segment ? [c.segment] : [])])].map((x) => `<option ${c.segment === x ? "selected" : ""}>${esc(x)}</option>`).join("")}</select></label>
+        <label class="mini"><span>ICP</span><select class="select" data-w="icp"><option value="">—</option>${Object.entries(ICP).map(([k, l]) => `<option value="${k}" ${c.icp === k ? "selected" : ""}>${l}</option>`).join("")}</select></label>
+        <label class="mini"><span>Місяць циклу</span><select class="select" data-w="cycle_month"><option value="">Не в плані</option>${[1, 2, 3].map((m) => `<option value="${m}" ${c.cycleMonth === m ? "selected" : ""}>Місяць ${m}</option>`).join("")}</select></label>
       </div>
+      <label class="mini wide"><span>Підтвердження / посилання (CRM, листування, LinkedIn)</span><input class="input" data-w="proof" value="${esc(c.proof)}" placeholder="https://…"></label>
+      <label class="mini wide"><span>Блокер / потрібна допомога</span><textarea class="input" data-w="blocker" rows="2" placeholder="Що заважає рухатися далі">${esc(c.blocker)}</textarea></label>
+    </div>
+
+    <div class="sec">
+      <h4>Зарахування <small>${c.credited ? `<span class="ok">зараховано ${esc(fmtDate(c.credited))}</span>` : `${c.checks.filter((x) => x[1]).length} з ${c.checks.length} умов`}</small></h4>
+      <ul class="checklist">${c.checks.map(([l, ok]) => `<li class="${ok ? "ok" : ""}">${esc(l)}</li>`).join("")}</ul>
+      ${c.credited ? "" : `<div class="faint" style="margin-top:8px">Чого не вистачає: ${esc(c.missing.join("; "))}</div>`}
+    </div>
+
+    <div class="sec">
+      <h4>Контакти (ЛПР) <small id="cCount"></small></h4>
+      <div id="cList" class="contacts"><div class="faint">Завантаження…</div></div>
+      <details class="cform-wrap" id="cWrap">
+        <summary class="btn small">Додати контакт</summary>
+        <form class="touch-form" id="cForm" autocomplete="off" style="margin-top:10px">
+          <input type="hidden" name="id">
+          <div class="row2">
+            <input class="input" name="full_name" required placeholder="Ім'я та прізвище">
+            <input class="input" name="position" placeholder="Посада (CEO, prezes zarządu…)">
+          </div>
+          <div class="row3">
+            <input class="input" name="email" type="email" placeholder="Email">
+            <input class="input" name="phone" placeholder="Телефон">
+            <select class="select" name="language" aria-label="Мова"><option value="">Мова: —</option>${LANGS.map((l) => `<option>${l}</option>`).join("")}</select>
+          </div>
+          <input class="input" name="linkedin" placeholder="LinkedIn: https://www.linkedin.com/in/…">
+          <div class="row2">
+            <input class="input" name="source" placeholder="Джерело (KRS / CRBR, Sales Nav…)">
+            <select class="select" name="invite" aria-label="Запрошення в LinkedIn"><option value="">Запрошення: —</option>${Object.entries(INVITE).map(([k, l]) => `<option value="${k}">${l}</option>`).join("")}</select>
+          </div>
+          <textarea class="input" name="note" rows="2" placeholder="Нотатки"></textarea>
+          <div class="actions">
+            <label class="chk"><input type="checkbox" name="relevant" checked><span>Релевантний ЛПР</span></label>
+            <button class="btn primary" type="submit">Зберегти контакт</button>
+            <button class="btn small" type="button" id="cCancel">Скасувати</button>
+            <span class="faint" id="cMsg"></span>
+          </div>
+        </form>
+      </details>
     </div>
 
     <div class="sec">
@@ -852,18 +976,21 @@ function openDrawer(krs) {
           <select class="select" name="direction" aria-label="Напрям"><option value="out">Ми → клієнт</option><option value="in">Клієнт → ми</option><option value="">—</option></select>
         </div>
         <div class="row2">
-          <input class="input" name="contact" list="tContacts" placeholder="З ким (ім'я, посада)">
+          <select class="select" name="contact_id" id="tContact" aria-label="З ким"><option value="">З ким: —</option></select>
           <select class="select" name="outcome" aria-label="Результат"><option value="">Результат: —</option>${Object.entries(OUTCOMES).map(([k, l]) => `<option value="${k}">${l}</option>`).join("")}</select>
         </div>
-        <datalist id="tContacts">${[...new Set([...c.owners.map((o) => o.name), ...(known(d.dm) ? String(d.dm).split(/;\s*/) : [])])].map((n) => `<option value="${esc(n)}">`).join("")}</datalist>
         <textarea class="input" name="summary" rows="3" required placeholder="Що було: про що говорили, що з'ясували, що надіслали…"></textarea>
         <div class="row-next">
           <input class="input" name="next_step" placeholder="Наступний крок (напр. надіслати пропозицію)">
           <input class="input" type="date" name="next_date" aria-label="Дата наступного кроку">
         </div>
+        <div class="flagrow">
+          <label class="chk"><input type="checkbox" name="meaningful" checked><span>Змістовний</span></label>
+          ${Object.entries(TOUCH_FLAGS).map(([k, l]) => `<label class="chk"><input type="checkbox" name="${k}"><span>${l}</span></label>`).join("")}
+        </div>
         <div class="actions">
           <button class="btn primary" type="submit">Додати дотик</button>
-          <span class="faint" id="tMsg">Перший дотик переведе статус «Не опрацьовано» / «Дослідження» у «Контакт».</span>
+          <span class="faint" id="tMsg">Теплий — предметний інтерес, погоджений дзвінок чи запит інформації; прийняте запрошення чи «дякую» не рахуються. Discovery і кваліфікацію позначайте після фактичної події.</span>
         </div>
       </form>
       <div class="timeline" id="tList"><div class="faint">Завантаження…</div></div>
@@ -936,15 +1063,17 @@ function openDrawer(krs) {
   document.addEventListener("keydown", escClose);
   const saveWork = async (patch) => {
     try {
-      const r = await api("set_work", { krs, ...patch });
-      c.work = r.work; c.status = r.work.status; c.owner = r.work.owner || "";
-      $("#wMsg", dr).innerHTML = `<span class="ok">збережено</span>`;
-      renderView();
+      await api("set_work", { krs, ...patch });
+      await refreshDrawer(krs, `<span class="ok">збережено</span>`);
     } catch (err) { $("#wMsg", dr).textContent = err.message; }
   };
-  $("#wStatus", dr).addEventListener("change", (e) => saveWork({ status: e.target.value }));
-  $("#wOwner", dr).addEventListener("change", (e) => saveWork({ owner: e.target.value }));
-  $("#wPrio", dr).addEventListener("change", (e) => saveWork({ priority: e.target.value }));
+  dr.querySelectorAll("[data-w]").forEach((el) => el.addEventListener("change", () => {
+    const k = el.dataset.w;
+    if (k === "cycle_month" && el.value && !c.owner) $("#wMsg", dr).textContent = "Не забудьте призначити відповідального";
+    saveWork({ [k]: el.value });
+  }));
+  const chan = $("#tForm", dr).channel, meaningfulBox = $("#tForm", dr).meaningful;
+  chan.addEventListener("change", () => { meaningfulBox.checked = chan.value !== "note"; meaningfulBox.disabled = chan.value === "note"; });
 
   $("#tForm", dr).addEventListener("submit", async (e) => {
     e.preventDefault();
@@ -954,20 +1083,85 @@ function openDrawer(krs) {
     btn.disabled = true;
     try {
       const touchedAt = fd.touched_at ? new Date(fd.touched_at).toISOString() : undefined;
-      await api("add_touch", { krs, ...fd, touched_at: touchedAt });
-      if (fd.channel !== "note" && (c.status === "new" || c.status === "research")) {
-        await saveWork({ status: "contacted" });
-        $("#wStatus", dr).value = "contacted";
-      }
-      form.reset();
-      form.touched_at.value = localNow();
-      $("#tMsg", dr).innerHTML = `<span class="ok">Дотик додано</span>`;
-      await loadTouches(c, dr);
-      renderView();
-    } catch (err) { $("#tMsg", dr).textContent = err.message; }
-    btn.disabled = false;
+      const flags = Object.fromEntries(["meaningful", ...Object.keys(TOUCH_FLAGS)].map((k) => [k, !!form[k].checked]));
+      await api("add_touch", { krs, ...fd, ...flags, touched_at: touchedAt });
+      if (fd.channel !== "note" && (c.status === "new" || c.status === "research")) await api("set_work", { krs, status: "contacted" });
+      await refreshDrawer(krs, "", `<span class="ok">Дотик додано</span>`);
+    } catch (err) { $("#tMsg", dr).textContent = err.message; btn.disabled = false; }
   });
+
+  const cForm = $("#cForm", dr);
+  const resetContactForm = () => { cForm.reset(); cForm.id.value = ""; $("#cWrap", dr).open = false; };
+  $("#cCancel", dr).addEventListener("click", resetContactForm);
+  cForm.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const fd = Object.fromEntries(new FormData(cForm));
+    try {
+      await api("save_contact", { krs, ...fd, id: fd.id ? Number(fd.id) : undefined, relevant: cForm.relevant.checked });
+      await refreshDrawer(krs);
+    } catch (err) { $("#cMsg", dr).textContent = err.message; }
+  });
+  loadContacts(c, dr);
   loadTouches(c, dr);
+}
+
+// Reloads everything (crediting, aggregates, the list behind the drawer) and rebuilds the drawer in place.
+async function refreshDrawer(krs, workMsg = "", touchMsg = "") {
+  const old = document.querySelector(".drawer");
+  const top = old ? old.scrollTop : 0;
+  await loadData(true);
+  openDrawer(krs);
+  const dr = document.querySelector(".drawer");
+  if (!dr) return;
+  dr.scrollTop = top;
+  if (workMsg) $("#wMsg", dr).innerHTML = workMsg;
+  if (touchMsg) $("#tMsg", dr).innerHTML = touchMsg;
+}
+
+async function loadContacts(c, dr) {
+  const list = $("#cList", dr);
+  try {
+    const { contacts } = await api("contacts", { krs: c.krs });
+    const me = state.user;
+    $("#cCount", dr).textContent = contacts.length ? `${contacts.filter((x) => x.relevant).length} релевантних з ${contacts.length}` : "";
+    $("#tContact", dr).innerHTML = `<option value="">З ким: —</option>` + contacts.map((x) => `<option value="${x.id}">${esc(x.full_name)}${x.position ? ` · ${esc(x.position)}` : ""}</option>`).join("");
+    if (!contacts.length) {
+      const hints = [...new Set([...c.owners.map((o) => o.name), ...(known(c.d.dm) ? String(c.d.dm).split(/;\s*/) : [])])];
+      list.innerHTML = `<div class="faint">Контактів ще немає.${hints.length ? ` З реєстру: ${esc(hints.join(", "))}.` : ""}</div>`;
+      return;
+    }
+    list.innerHTML = contacts.map((x) => `
+      <div class="contact">
+        <div class="h"><b>${esc(x.full_name)}</b>${x.position ? `<span>${esc(x.position)}</span>` : ""}
+          ${x.relevant ? `<span class="badge hi">ЛПР</span>` : `<span class="badge">не ЛПР</span>`}
+          ${x.language ? `<span class="badge">${esc(x.language)}</span>` : ""}
+          ${x.invite ? `<span class="badge ${x.invite === "accepted" ? "new" : ""}">${esc(INVITE[x.invite])}</span>` : ""}</div>
+        <div class="cl">
+          ${x.linkedin ? `<a href="${esc(x.linkedin)}" target="_blank" rel="noopener noreferrer">LinkedIn</a>` : ""}
+          ${x.email ? `<a href="mailto:${esc(x.email)}">${esc(x.email)}</a>` : ""}
+          ${x.phone ? `<a href="tel:${esc(x.phone.replace(/[^\d+]/g, ""))}">${esc(x.phone)}</a>` : ""}
+          ${x.source ? `<span class="faint">джерело: ${esc(x.source)}</span>` : ""}
+        </div>
+        ${x.note ? `<div class="txt">${esc(x.note)}</div>` : ""}
+        <div class="h"><span>додав ${esc(x.created_by || "")}</span>
+          <button class="del" data-cedit="${x.id}">редагувати</button>
+          ${x.created_by_id === me.id || me.role === "admin" ? `<button class="del" data-cdel="${x.id}">видалити</button>` : ""}</div>
+      </div>`).join("");
+    list.querySelectorAll("[data-cedit]").forEach((b) => b.addEventListener("click", () => {
+      const x = contacts.find((k) => k.id === Number(b.dataset.cedit));
+      const f = $("#cForm", dr);
+      for (const k of ["id", "full_name", "position", "email", "phone", "language", "linkedin", "source", "invite", "note"]) f[k].value = x[k] ?? "";
+      f.relevant.checked = x.relevant;
+      $("#cWrap", dr).open = true;
+      f.full_name.focus();
+    }));
+    list.querySelectorAll("[data-cdel]").forEach((b) => b.addEventListener("click", async () => {
+      if (!confirm("Видалити контакт? Дотики з ним залишаться в історії.")) return;
+      try { await api("delete_contact", { id: Number(b.dataset.cdel) }); await refreshDrawer(c.krs); } catch (err) { alert(err.message); }
+    }));
+  } catch (err) {
+    list.innerHTML = `<div class="error">${esc(err.message)}</div>`;
+  }
 }
 
 function localNow() {
@@ -982,10 +1176,6 @@ async function loadTouches(c, dr) {
     const { touches } = await api("touches", { krs: c.krs });
     // Entries logged within the same minute: newest insert first.
     touches.sort((x, y) => y.touched_at.localeCompare(x.touched_at) || y.id - x.id);
-    c.touchCount = touches.length;
-    c.lastTouch = touches[0] || null;
-    c.nextDate = c.lastTouch?.next_date || null;
-    c.overdue = !!c.nextDate && c.nextDate < todayIso();
     $("#tCount", dr).textContent = touches.length ? `${touches.length} ${plural(touches.length, "запис", "записи", "записів")}` : "";
     if (!touches.length) { list.innerHTML = `<div class="faint">Ще не було жодного дотику.</div>`; return; }
     const me = state.user;
@@ -997,6 +1187,8 @@ async function loadTouches(c, dr) {
           <span>· ${esc(fmtDT(t.touched_at))}</span>
           ${t.contact ? `<span>· ${esc(t.contact)}</span>` : ""}
           ${t.outcome ? `<span class="badge ${t.outcome === "not_interested" ? "lo" : t.outcome === "no_answer" ? "" : "new"}">${esc(OUTCOMES[t.outcome] || t.outcome)}</span>` : ""}
+          ${t.channel !== "note" && !t.meaningful ? `<span class="badge">не змістовний</span>` : ""}
+          ${Object.entries(TOUCH_FLAGS).filter(([k]) => t[k]).map(([, l]) => `<span class="badge hi">${l}</span>`).join("")}
           ${t.author_id === me.id || me.role === "admin" ? `<button class="del" data-del="${t.id}" title="Видалити запис">видалити</button>` : ""}
         </div>
         <div class="txt">${esc(t.summary)}</div>
@@ -1005,7 +1197,7 @@ async function loadTouches(c, dr) {
       </div>`).join("");
     list.querySelectorAll("[data-del]").forEach((b) => b.addEventListener("click", async () => {
       if (!confirm("Видалити цей запис з історії?")) return;
-      try { await api("delete_touch", { id: Number(b.dataset.del) }); await loadTouches(c, dr); renderView(); } catch (err) { alert(err.message); }
+      try { await api("delete_touch", { id: Number(b.dataset.del) }); await refreshDrawer(c.krs); } catch (err) { alert(err.message); }
     }));
   } catch (err) {
     list.innerHTML = `<div class="error">${esc(err.message)}</div>`;
@@ -1018,6 +1210,173 @@ function closeDrawer(keepState) {
   document.querySelectorAll(".drawer, .scrim").forEach((el) => el.remove());
   document.removeEventListener("keydown", escClose);
   if (!keepState) { state.openKrs = null; writeHash(); }
+}
+
+// ---------- cycle ----------
+const isoOf = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+const localDay = (ts) => (ts ? isoOf(new Date(ts)) : null);
+const shiftDay = (day, n) => { const d = new Date(day + "T12:00:00"); d.setDate(d.getDate() + n); return isoOf(d); };
+
+const METRICS = [
+  ["companies", "Компанії зі змістовними дотиками"],
+  ["touches", "Змістовні дотики"],
+  ["warm", "Теплі компанії"],
+  ["discovery", "Discovery"],
+  ["qualified", "Кваліфіковані потреби"],
+  ["credited", "Зараховано"],
+];
+
+function cyclePeriods() {
+  const t = todayIso();
+  const ws = shiftDay(t, -((new Date(t + "T12:00:00").getDay() + 6) % 7));
+  const d = new Date(t + "T12:00:00");
+  const cy = state.cycle || {};
+  return [
+    ["Поточний тиждень", ws, shiftDay(ws, 6)],
+    ["Попередній тиждень", shiftDay(ws, -7), shiftDay(ws, -1)],
+    ["Поточний місяць", t.slice(0, 8) + "01", isoOf(new Date(d.getFullYear(), d.getMonth() + 1, 0))],
+    ["Весь цикл", cy.start, cy.end],
+  ];
+}
+
+// Companies count once per period however many touches they got; touches count each.
+function cycleMetrics(a, b, who) {
+  const inP = (day) => !!day && !!a && !!b && day >= a && day <= b;
+  const ts = state.touchLog.filter((t) => t.m && inP(localDay(t.at)) && (!who || t.auid === who.id));
+  const uniq = (fn) => new Set(ts.filter(fn).map((t) => t.krs)).size;
+  return {
+    companies: uniq(() => true), touches: ts.length, warm: uniq((t) => t.w), discovery: uniq((t) => t.d), qualified: uniq((t) => t.q),
+    credited: state.data.filter((c) => inP(c.credited) && (!who || c.owner === who.name)).length,
+    channels: countBy(ts, (t) => t.ch),
+  };
+}
+
+const QUALITY = [
+  ["noowner", "Без відповідального", "Призначити відповідального"],
+  ["notouch", "Без дотиків", "Почати комунікацію"],
+  ["noicp", "ICP не підтверджено", "Підтвердити ICP"],
+  ["lt2dm", "Менше 2 ЛПР", "Додати decision makers"],
+  ["lt3", "Менше 3 змістовних дотиків", "Продовжити комунікацію"],
+  ["lt2ch", "Менше 2 каналів", "Додати другий канал"],
+  ["nonext", "Немає наступної дії з датою", "Поставити конкретний follow-up"],
+  ["overdue", "Прострочена наступна дія", "Виконати або перенести"],
+  ["noproof", "Немає підтвердження", "Додати CRM / листування / LinkedIn"],
+  ["blocker", "Є блокер", "Потрібна допомога керівника"],
+];
+
+const pct = (n, d) => (d ? Math.round((n / d) * 100) : 0);
+
+function renderCycle() {
+  const cy = state.cycle || { targets: {}, plan: {} };
+  const targets = cy.targets || {};
+  const periods = cyclePeriods();
+  const vals = periods.map(([, a, b]) => cycleMetrics(a, b));
+  const whole = vals[3];
+  const t = todayIso();
+  const totalDays = cy.start && cy.end ? Math.round((new Date(cy.end) - new Date(cy.start)) / 86400000) + 1 : 0;
+  const passed = totalDays ? Math.min(totalDays, Math.max(0, Math.round((new Date(t) - new Date(cy.start)) / 86400000) + 1)) : 0;
+  const pace = pct(passed, totalDays);
+  const inPlan = state.data.filter((c) => !c.removed && c.cycleMonth);
+  const soon = inPlan.filter((c) => c.nextDate && c.nextDate >= t && c.nextDate <= shiftDay(t, 7)).length;
+  const isAdmin = state.user.role === "admin";
+
+  const teamRows = state.teamUsers.map((u) => {
+    const m = cycleMetrics(cy.start, cy.end, u);
+    return { name: u.name, plan: cy.plan?.[u.id] ?? 0, inPlan: inPlan.filter((c) => c.owner === u.name).length, ...m };
+  });
+  const sum = (k) => teamRows.reduce((a, r) => a + r[k], 0);
+
+  const chTotal = [...whole.channels.values()].reduce((a, n) => a + n, 0);
+  const chRows = [...whole.channels.entries()].sort((a, b) => b[1] - a[1]);
+  // Each step converts from the one before it, except crediting, which is measured against all touched companies.
+  const funnel = [["Компанії з дотиками", whole.companies], ["Теплі", whole.warm, 0], ["Discovery", whole.discovery, 1], ["Кваліфіковані", whole.qualified, 2], ["Зараховано", whole.credited, 0]];
+  const fMax = Math.max(1, funnel[0][1]);
+  const quality = QUALITY.map(([k, l, act]) => [k, l, act, inPlan.filter(FLAGS[k].test).length]);
+
+  $("#view").innerHTML = `
+  <div class="kpis">
+    <div class="kpi static"><div class="v">${passed}<small>/${totalDays}</small></div><div class="l">Днів циклу минуло</div><div class="s">${esc(fmtDate(cy.start))} – ${esc(fmtDate(cy.end))} · ${pace}% часу</div></div>
+    <button class="kpi" data-q="inplan"><div class="v">${inPlan.length}</div><div class="l">Компаній у плані</div><div class="s">з позначкою «Місяць циклу»</div></button>
+    <button class="kpi" data-q="notouch"><div class="v">${quality[1][3]}</div><div class="l">У плані без дотиків</div><div class="s">почати комунікацію</div></button>
+    <button class="kpi ${quality[7][3] ? "accent" : ""}" data-q="overdue"><div class="v">${quality[7][3]}</div><div class="l">Прострочених дій</div><div class="s">${soon} дій на наступні 7 днів</div></button>
+    <button class="kpi" data-q="credited"><div class="v">${whole.credited}</div><div class="l">Зараховано за цикл</div><div class="s">ціль ${targets.credited ?? "—"}</div></button>
+  </div>
+
+  <div class="panel" style="margin-bottom:12px">
+    <h3>Ключові показники</h3>
+    <div class="sub">Рахуються лише змістовні дотики. Риска на шкалі — де мали б бути за часом (${pace}% циклу)</div>
+    <div class="tablewrap flat"><table class="metrics">
+      <thead><tr><th>Показник</th>${periods.map(([l, a, b]) => `<th class="num" title="${esc(fmtDate(a))} – ${esc(fmtDate(b))}">${esc(l)}</th>`).join("")}<th class="num">Ціль циклу</th><th>Виконання</th></tr></thead>
+      <tbody>${METRICS.map(([k, l]) => {
+        const goal = targets[k] || 0, got = whole[k], p = pct(got, goal);
+        return `<tr><td>${esc(l)}</td>${vals.map((v) => `<td class="num">${v[k]}</td>`).join("")}<td class="num">${goal || "—"}</td>
+          <td>${goal ? `<div class="prog ${p >= pace ? "ahead" : ""}"><span style="width:${Math.min(100, p)}%"></span><i style="left:${pace}%"></i></div><div class="sub">${p}%</div>` : `<span class="faint">ціль не задано</span>`}</td></tr>`;
+      }).join("")}</tbody>
+    </table></div>
+  </div>
+
+  <div class="panel" style="margin-bottom:12px">
+    <h3>Команда</h3>
+    <div class="sub">План — компаній на місяць. Дотики й етапи — за автором дотику; «У плані» і «Зараховано» — за відповідальним компанії. Весь цикл</div>
+    <div class="tablewrap flat"><table class="metrics">
+      <thead><tr><th>Відповідальний</th><th class="num">План / міс.</th><th class="num">У плані</th><th class="num">Компаній з дотиками</th><th class="num">Дотиків</th><th class="num">Теплі</th><th class="num">Discovery</th><th class="num">Кваліф.</th><th class="num">Зараховано</th></tr></thead>
+      <tbody>${teamRows.map((r) => `<tr data-owner="${esc(r.name)}"><td><b>${esc(r.name)}</b></td><td class="num">${r.plan}</td><td class="num">${r.inPlan}</td><td class="num">${r.companies}</td><td class="num">${r.touches}</td><td class="num">${r.warm}</td><td class="num">${r.discovery}</td><td class="num">${r.qualified}</td><td class="num">${r.credited}</td></tr>`).join("")}
+        <tr class="total"><td>Команда</td><td class="num">${sum("plan")}</td><td class="num">${inPlan.length}</td><td class="num">${whole.companies}</td><td class="num">${whole.touches}</td><td class="num">${whole.warm}</td><td class="num">${whole.discovery}</td><td class="num">${whole.qualified}</td><td class="num">${whole.credited}</td></tr>
+      </tbody>
+    </table></div>
+  </div>
+
+  <div class="grid2">
+    <div class="panel">
+      <h3>Канали</h3>
+      <div class="sub">Змістовні дотики за весь цикл</div>
+      ${chRows.length ? chRows.map(([ch, n]) => `<div class="hbar static"><span class="lbl">${esc(CHANNELS[ch] || ch)}</span><span class="track"><span class="fill" style="width:${pct(n, chTotal)}%"></span></span><span class="n">${pct(n, chTotal)}%</span></div><div class="sub" style="margin:-2px 0 6px 6px">${n} ${plural(n, "дотик", "дотики", "дотиків")}</div>`).join("") : `<div class="faint">Ще немає змістовних дотиків у межах циклу</div>`}
+    </div>
+    <div class="panel">
+      <h3>Воронка</h3>
+      <div class="sub">Унікальні компанії за весь цикл; відсоток — перехід з попереднього етапу, для «Зараховано» — від компаній з дотиками</div>
+      ${funnel.map(([l, n], i) => `<div class="funnel"><span class="lbl">${esc(l)}</span><span class="track"><span class="fill" style="width:${(n / fMax) * 100}%"></span></span><span class="n">${n}</span><span class="conv" title="${i ? `від «${esc(funnel[funnel[i][2]][0])}»` : ""}">${i ? `${pct(n, funnel[funnel[i][2]][1])}%` : ""}</span></div>`).join("")}
+    </div>
+  </div>
+
+  <div class="panel" style="margin-bottom:12px">
+    <h3>Якість даних</h3>
+    <div class="sub">Серед ${inPlan.length} ${plural(inPlan.length, "компанії", "компаній", "компаній")} у плані циклу. Клік відкриває список</div>
+    ${inPlan.length ? `<div class="quality">${quality.map(([k, l, act, n]) => `<button class="qrow ${n ? "" : "zero"}" data-q="${k}"><span class="n">${n}</span><span class="l">${esc(l)}</span><span class="act">${esc(act)}</span></button>`).join("")}</div>`
+      : `<div class="faint">У плані поки немає компаній. Відкрийте картку компанії й оберіть «Місяць циклу».</div>`}
+  </div>
+
+  ${isAdmin ? `
+  <form class="panel formgrid" id="cycleForm">
+    <h3>Налаштування циклу</h3>
+    <div class="sub">Бачать усі; змінює лише адміністратор</div>
+    <div class="cyc-grid">
+      <label class="mini"><span>Початок</span><input class="input" type="date" name="start" value="${esc(cy.start || "")}" required></label>
+      <label class="mini"><span>Кінець</span><input class="input" type="date" name="end" value="${esc(cy.end || "")}" required></label>
+    </div>
+    <h4 class="formh">Цілі на цикл</h4>
+    <div class="cyc-grid">${METRICS.map(([k, l]) => `<label class="mini"><span>${esc(l)}</span><input class="input" type="number" min="0" name="t_${k}" value="${targets[k] ?? 0}"></label>`).join("")}</div>
+    <h4 class="formh">План: компаній на місяць</h4>
+    <div class="cyc-grid">${state.teamUsers.map((u) => `<label class="mini"><span>${esc(u.name)}</span><input class="input" type="number" min="0" name="p_${u.id}" value="${cy.plan?.[u.id] ?? 0}"></label>`).join("")}</div>
+    <div class="actions"><button class="btn primary" type="submit">Зберегти</button><span class="faint" id="cyMsg"></span></div>
+  </form>` : ""}`;
+
+  $("#view").querySelectorAll("[data-q]").forEach((el) => el.addEventListener("click", () => {
+    const k = el.dataset.q;
+    drill({ flags: k === "inplan" || k === "credited" ? [k] : ["inplan", k] });
+  }));
+  $("#view").querySelectorAll("[data-owner]").forEach((el) => el.addEventListener("click", () => drill({ owner: [el.dataset.owner], flags: ["inplan"] })));
+  if (isAdmin) $("#cycleForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const f = e.target;
+    const body = {
+      start: f.start.value, end: f.end.value,
+      targets: Object.fromEntries(METRICS.map(([k]) => [k, Number(f[`t_${k}`].value)])),
+      plan: Object.fromEntries(state.teamUsers.map((u) => [u.id, Number(f[`p_${u.id}`].value)])),
+    };
+    try { const r = await api("set_cycle", body); state.cycle = r.cycle; renderCycle(); $("#cyMsg").innerHTML = `<span class="ok">Збережено</span>`; }
+    catch (err) { $("#cyMsg").textContent = err.message; }
+  });
 }
 
 // ---------- admin ----------
