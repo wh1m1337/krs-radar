@@ -1114,14 +1114,14 @@ async function loadAdminTables() {
         <td>${u.disabled ? `<span class="badge lo">заблоковано</span>` : u.must_change ? `<span class="badge mid">чекає зміни пароля</span>` : `<span class="badge hi">активний</span>`}
           ${u.locked_until && new Date(u.locked_until) > new Date() ? `<span class="badge lo">тимчасово заблоковано</span>` : ""}</td>
         <td class="num">${esc(fmtDT(u.last_login_at))}</td>
-        <td style="white-space:nowrap">
+        <td><div class="user-actions">
           <button class="btn small" data-act="rename" data-id="${u.id}" data-u="${esc(u.username)}" data-name="${esc(u.display_name || "")}">Змінити ім'я</button>
           <button class="btn small" data-act="reset" data-id="${u.id}" data-u="${esc(u.username)}">Скинути пароль</button>
           ${u.id !== me ? `
           <button class="btn small" data-act="role" data-id="${u.id}" data-role="${u.role}">${u.role === "admin" ? "Зробити користувачем" : "Зробити адміном"}</button>
           <button class="btn small" data-act="toggle" data-id="${u.id}" data-dis="${u.disabled}">${u.disabled ? "Розблокувати" : "Заблокувати"}</button>
           <button class="btn small danger" data-act="del" data-id="${u.id}" data-u="${esc(u.username)}">Видалити</button>` : `<span class="faint">це ви</span>`}
-        </td>
+        </div></td>
       </tr>`).join("");
     $("#logRows").innerHTML = log.length ? log.map((l) => `<tr><td class="num">${esc(fmtDT(l.at))}</td><td>${esc(l.source === "auto" ? "Автоматично" : l.source)}</td><td class="num">${l.total ?? ""}</td><td class="num">${l.inserted ?? ""}</td><td class="num">${l.updated ?? ""}</td></tr>`).join("")
       : `<tr><td colspan="5" class="faint">Ще не було імпортів</td></tr>`;
