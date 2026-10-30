@@ -398,9 +398,19 @@ async function handle(req: Request) {
     }
     if (body.role !== undefined) patch.role = body.role === "admin" ? "admin" : "user";
     if (body.disabled !== undefined) patch.disabled = !!body.disabled;
-    if (body.display_name !== undefined) patch.display_name = String(body.display_name).slice(0, 80);
+    if (body.display_name !== undefined) {
+      const name = String(body.display_name).trim().slice(0, 80);
+      if (!name) throw new HttpError(400, "Ім'я не може бути порожнім");
+      patch.display_name = name;
+    }
     if (id === user.id && (patch.role === "user" || patch.disabled)) throw new HttpError(400, "Не можна зняти права або заблокувати себе");
     await db.from("dash_users").update(patch).eq("id", id);
+    // Assignments and touch authors store the visible name, so carry them over to the new one.
+    const oldName = target.display_name || target.username;
+    if (patch.display_name && patch.display_name !== oldName) {
+      await db.from("krs_work").update({ owner: patch.display_name }).eq("owner", oldName);
+      await db.from("krs_touches").update({ author: patch.display_name }).eq("author_id", id);
+    }
     if (body.password || patch.disabled) await db.from("dash_sessions").delete().eq("user_id", id);
     return { ok: true };
   }

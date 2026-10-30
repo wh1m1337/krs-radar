@@ -431,7 +431,7 @@ function renderShell() {
       </nav>
       <div class="top-right">
         <span class="pill" id="sync"></span>
-        <span class="pill"><b>${esc(u.display_name || u.username)}</b></span>
+        <span class="pill"><b id="meName">${esc(u.display_name || u.username)}</b></span>
         <button class="btn" id="pwBtn">Пароль</button>
         <button class="btn blue" id="outBtn">Вийти</button>
       </div>
@@ -611,6 +611,12 @@ function bindRowOpen() {
 }
 
 // ---------- companies ----------
+// Owner counts plus every active team member, so people with no companies yet can be picked too.
+function withTeam(map) {
+  for (const t of state.team) if (!map.has(t)) map.set(t, 0);
+  return map;
+}
+
 function facet(title, key, map, labelFn = (x) => x, order) {
   const f = state.filters[key];
   let rows = [...map.entries()];
@@ -643,7 +649,7 @@ function renderCompanies() {
       </div>
       ${facet("Відповідність", "fit", fc("fit", (c) => c.fit), (x) => x, FIT_ORDER)}
       ${facet("Статус опрацювання", "status", fc("status", (c) => c.status), (x) => STATUS[x] || x, Object.keys(STATUS))}
-      ${facet("Відповідальний", "owner", fc("owner", (c) => c.owner || "—"), (x) => (x === "—" ? "Не призначено" : x))}
+      ${facet("Відповідальний", "owner", withTeam(fc("owner", (c) => c.owner || "—")), (x) => (x === "—" ? "Не призначено" : x))}
       ${facet("Галузь (PKD)", "sector", fc("sector", (c) => c.sector))}
       ${facet("Воєводство", "voiv", fc("voiv", (c) => c.voiv), titleCase)}
       <h4>Інше</h4>
@@ -654,6 +660,12 @@ function renderCompanies() {
       <div class="toolbar">
         <button class="btn filter-toggle" id="fToggle">Фільтри</button>
         <input class="input" id="q" type="search" placeholder="Пошук: назва, KRS, NIP, власник, місто, діяльність, нотатки…" value="${esc(f.q)}">
+        <select class="select" id="ownerSel" aria-label="Відповідальний">
+          <option value="">Відповідальний: усі</option>
+          <option value="—" ${f.owner.length === 1 && f.owner[0] === "—" ? "selected" : ""}>Не призначено</option>
+          ${state.team.map((t) => `<option value="${esc(t)}" ${f.owner.length === 1 && f.owner[0] === t ? "selected" : ""}>${esc(t)}${t === (state.user.display_name || state.user.username) ? " (я)" : ""}</option>`).join("")}
+          ${f.owner.length > 1 ? `<option selected disabled>Кілька: ${esc(f.owner.join(", "))}</option>` : ""}
+        </select>
         <select class="select" id="sortSel" aria-label="Сортування">
           ${[["score", "За відповідністю"], ["reg", "За датою реєстрації"], ["seen", "За появою в базі"], ["touch", "За останнім дотиком"], ["name", "За назвою"]].map(([k, l]) => `<option value="${k}" ${state.sort.key === k ? "selected" : ""}>${l}</option>`).join("")}
         </select>
@@ -688,6 +700,7 @@ function renderCompanies() {
     clearTimeout(qTimer);
     qTimer = setTimeout(() => { f.q = e.target.value; rerender(); const q = $("#q"); q.focus(); q.setSelectionRange(q.value.length, q.value.length); }, 250);
   });
+  $("#ownerSel").addEventListener("change", (e) => { f.owner = e.target.value ? [e.target.value] : []; rerender(); });
   $("#sortSel").addEventListener("change", (e) => { state.sort = { key: e.target.value, dir: e.target.value === "name" ? 1 : -1 }; rerender(); });
   $("#fFrom").addEventListener("change", (e) => { f.from = e.target.value; rerender(); });
   $("#fTo").addEventListener("change", (e) => { f.to = e.target.value; rerender(); });
@@ -1102,6 +1115,7 @@ async function loadAdminTables() {
           ${u.locked_until && new Date(u.locked_until) > new Date() ? `<span class="badge lo">тимчасово заблоковано</span>` : ""}</td>
         <td class="num">${esc(fmtDT(u.last_login_at))}</td>
         <td style="white-space:nowrap">
+          <button class="btn small" data-act="rename" data-id="${u.id}" data-u="${esc(u.username)}" data-name="${esc(u.display_name || "")}">Змінити ім'я</button>
           <button class="btn small" data-act="reset" data-id="${u.id}" data-u="${esc(u.username)}">Скинути пароль</button>
           ${u.id !== me ? `
           <button class="btn small" data-act="role" data-id="${u.id}" data-role="${u.role}">${u.role === "admin" ? "Зробити користувачем" : "Зробити адміном"}</button>
@@ -1119,7 +1133,16 @@ async function loadAdminTables() {
 
 async function userAction(ds) {
   try {
-    if (ds.act === "reset") {
+    if (ds.act === "rename") {
+      const name = prompt(`Ім'я для «${ds.u}», як його бачитиме команда (відповідальний, автор дотиків):`, ds.name);
+      if (name == null || !name.trim() || name.trim() === ds.name) return;
+      await api("update_user", { id: ds.id, display_name: name.trim() });
+      if (ds.id === state.user.id) {
+        state.user.display_name = name.trim();
+        $("#meName").textContent = name.trim();
+      }
+      await loadData(true);
+    } else if (ds.act === "reset") {
       const pw = genPassword();
       if (!confirm(`Новий тимчасовий пароль для «${ds.u}»:\n\n${pw}\n\nСкопіюйте його зараз. Користувач змінить його при вході. Продовжити?`)) return;
       await api("update_user", { id: ds.id, password: pw });
