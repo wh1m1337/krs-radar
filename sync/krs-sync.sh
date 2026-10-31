@@ -3,7 +3,7 @@
 # this script uploads it with the ingest key from ~/.config/krs-radar/ingest_key and restores
 # whatever the user had on the clipboard before.
 #   krs-sync.sh save   — stash the current clipboard
-#   krs-sync.sh push   — upload the clipboard workbook, then restore the stash
+#   krs-sync.sh push   — read the clipboard workbook into rows (xlsx2grid.py), upload them, then restore the stash
 set -euo pipefail
 
 API="https://aikyzkiyfgctyklfopzy.supabase.co/functions/v1/krs-api"
@@ -25,16 +25,19 @@ case "${1:-}" in
     ;;
   push)
     tmp="$(mktemp -t krs-sync)"
-    trap 'rm -f "$tmp"; if [ -f "$STASH" ]; then pbcopy < "$STASH"; rm -f "$STASH"; fi' EXIT
+    rows="$tmp.json"
+    trap 'rm -f "$tmp" "$rows"; if [ -f "$STASH" ]; then pbcopy < "$STASH"; rm -f "$STASH"; fi' EXIT
     pbpaste | base64 -D > "$tmp"
     if [ "$(head -c 2 "$tmp")" != "PK" ]; then
       echo "ERROR: clipboard does not hold an xlsx file" >&2
       exit 1
     fi
+    # Read the workbook here: the server runs out of CPU time parsing a large xlsx.
+    python3 -I "$(dirname "$0")/xlsx2grid.py" "$tmp" > "$rows"
     curl -sS --fail-with-body -X POST "$API" \
       -H "x-ingest-key: $(cat "$KEY_FILE")" \
-      -H "content-type: application/octet-stream" \
-      --data-binary "@$tmp"
+      -H "content-type: application/json" \
+      --data-binary "@$rows"
     echo
     ;;
   *)

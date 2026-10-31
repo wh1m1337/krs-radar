@@ -165,20 +165,26 @@ function clean(v: unknown) {
   return s === "" ? null : s;
 }
 
-function parseWorkbook(buf: Uint8Array) {
-  const wb = XLSX.read(buf, { type: "array", cellDates: true });
+type Grids = Record<string, unknown[][]>;
+
+function workbookGrids(buf: Uint8Array): Grids {
+  const wb = XLSX.read(buf, { type: "array", cellDates: true, cellHTML: false, cellText: false, cellFormula: false });
+  return Object.fromEntries(wb.SheetNames.map((n) => [n, XLSX.utils.sheet_to_json<unknown[]>(wb.Sheets[n], { header: 1, raw: true, defval: null })]));
+}
+
+function parseGrids(sheets: Grids) {
   const rows = new Map<string, { sheet: string; data: Record<string, unknown> }>();
   // Master sheet wins over the older profile layout for the same KRS.
-  const order = [...wb.SheetNames].sort((a, b) => (b.toLowerCase().includes("master") ? 1 : 0) - (a.toLowerCase().includes("master") ? 1 : 0));
+  const order = Object.keys(sheets).sort((a, b) => (b.toLowerCase().includes("master") ? 1 : 0) - (a.toLowerCase().includes("master") ? 1 : 0));
   for (const sheetName of order) {
-    const ws = wb.Sheets[sheetName];
-    const grid = XLSX.utils.sheet_to_json<unknown[]>(ws, { header: 1, raw: true, defval: null });
-    if (grid.length < 2) continue;
+    const grid = sheets[sheetName];
+    if (!Array.isArray(grid) || grid.length < 2) continue;
     const headers = (grid[0] as unknown[]).map((h) => String(h ?? "").trim());
     // The fit column's header carries a company name, so match it by its first word only.
     const keys = headers.map((h) => HEADER_MAP[h.toLowerCase()] ?? (/^відповідність(\s|$)/i.test(h) ? "src_fit" : null));
     if (!keys.includes("krs")) continue;
     for (const r of grid.slice(1)) {
+      if (!Array.isArray(r)) continue;
       const d: Record<string, unknown> = {};
       const extra: Record<string, unknown> = {};
       headers.forEach((h, i) => {
@@ -216,8 +222,8 @@ async function selectAll(build: () => any, page = 1000) {
   }
 }
 
-async function ingest(buf: Uint8Array, source: string) {
-  const rows = parseWorkbook(buf);
+async function ingest(sheets: Grids, source: string) {
+  const rows = parseGrids(sheets);
   if (rows.size === 0) throw new HttpError(400, "У файлі не знайдено аркушів з колонкою KRS");
   const { data: existing } = await selectAll(() => db.from("krs_companies").select("krs, content_hash, source_sheet").order("krs"));
   const ex = new Map((existing ?? []).map((e) => [e.krs, e]));
@@ -292,11 +298,11 @@ async function handle(req: Request) {
   if (ingestKey) {
     const { data } = await db.from("dash_settings").select("value").eq("key", "ingest_key_sha256").single();
     if (!data || (await sha256hex(ingestKey)) !== data.value) throw new HttpError(401, "Невірний ключ синхронізації");
+    // The sync sends rows already read from the workbook ({sheets}); parsing a large xlsx here runs out of CPU time.
     const ct = req.headers.get("content-type") ?? "";
-    const buf = ct.includes("json")
-      ? decodeBase64((await req.json()).file_base64)
-      : new Uint8Array(await req.arrayBuffer());
-    return await ingest(buf, "auto");
+    if (!ct.includes("json")) return await ingest(workbookGrids(new Uint8Array(await req.arrayBuffer())), "auto");
+    const b = await req.json();
+    return await ingest(b.sheets ?? workbookGrids(decodeBase64(b.file_base64)), "auto");
   }
 
   const body = await req.json().catch(() => ({}));
@@ -574,7 +580,7 @@ async function handle(req: Request) {
   }
 
   if (action === "upload_xlsx") {
-    return await ingest(decodeBase64(String(body.file_base64 ?? "")), `manual:${user.username}`);
+    return await ingest(body.sheets ?? workbookGrids(decodeBase64(String(body.file_base64 ?? ""))), `manual:${user.username}`);
   }
 
   if (action === "rotate_ingest_key") {
