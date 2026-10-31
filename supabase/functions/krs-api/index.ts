@@ -204,10 +204,22 @@ function parseWorkbook(buf: Uint8Array) {
   return rows;
 }
 
+// PostgREST caps each response at 1000 rows, so read big tables page by page.
+// The builder must apply a stable order so pages don't overlap.
+async function selectAll(build: () => any, page = 1000) {
+  const out: any[] = [];
+  for (let from = 0; ; from += page) {
+    const { data, error } = await build().range(from, from + page - 1);
+    if (error) throw new HttpError(500, error.message);
+    out.push(...(data ?? []));
+    if (!data || data.length < page) return { data: out };
+  }
+}
+
 async function ingest(buf: Uint8Array, source: string) {
   const rows = parseWorkbook(buf);
   if (rows.size === 0) throw new HttpError(400, "У файлі не знайдено аркушів з колонкою KRS");
-  const { data: existing } = await db.from("krs_companies").select("krs, content_hash, source_sheet");
+  const { data: existing } = await selectAll(() => db.from("krs_companies").select("krs, content_hash, source_sheet").order("krs"));
   const ex = new Map((existing ?? []).map((e) => [e.krs, e]));
   const now = new Date().toISOString();
   const upserts: Record<string, unknown>[] = [];
@@ -334,13 +346,13 @@ async function handle(req: Request) {
 
   if (action === "data") {
     const [{ data: companies }, { data: work }, { data: users }, { data: syncs }, { data: touches }, { data: contacts }, cycle] = await Promise.all([
-      db.from("krs_companies").select("krs, data, source_sheet, first_seen_at, updated_at"),
-      db.from("krs_work").select("*"),
+      selectAll(() => db.from("krs_companies").select("krs, data, source_sheet, first_seen_at, updated_at").order("krs")),
+      selectAll(() => db.from("krs_work").select("*").order("krs")),
       db.from("dash_users").select("id, username, display_name").eq("disabled", false).order("created_at"),
       db.from("krs_sync_log").select("at, source, total, inserted, updated").order("at", { ascending: false }).limit(1),
-      db.from("krs_touches").select("id, krs, touched_at, channel, summary, outcome, next_step, next_date, author, author_id, meaningful, warm, discovery, qualified")
-        .order("touched_at", { ascending: false }).order("id", { ascending: false }),
-      db.from("krs_contacts").select("krs, relevant"),
+      selectAll(() => db.from("krs_touches").select("id, krs, touched_at, channel, summary, outcome, next_step, next_date, author, author_id, meaningful, warm, discovery, qualified")
+        .order("touched_at", { ascending: false }).order("id", { ascending: false })),
+      selectAll(() => db.from("krs_contacts").select("krs, relevant").order("id")),
       readCycle(),
     ]);
     const w = new Map((work ?? []).map((x) => [x.krs, x]));
