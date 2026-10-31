@@ -1,5 +1,5 @@
 #!/bin/bash
-# Hourly KRS Radar sync helper. The browser step copies the workbook (base64) to the clipboard;
+# KRS Radar sync helper (runs every 30 min). The browser step copies the workbook (base64) to the clipboard;
 # this script uploads it with the ingest key from ~/.config/krs-radar/ingest_key and restores
 # whatever the user had on the clipboard before.
 #   krs-sync.sh save   — stash the current clipboard
@@ -14,6 +14,11 @@ export LC_ALL=en_US.UTF-8
 
 case "${1:-}" in
   save)
+    # A fresh stash means the previous run is still between save and push; don't overwrite it.
+    if [ -f "$STASH" ] && [ -n "$(find "$STASH" -mmin -50)" ]; then
+      echo "BUSY: previous sync still running" >&2
+      exit 3
+    fi
     pbpaste > "$STASH" 2>/dev/null || : > "$STASH"
     chmod 600 "$STASH"
     echo "clipboard saved"
