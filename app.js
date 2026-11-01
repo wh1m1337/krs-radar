@@ -1447,8 +1447,7 @@ async function renderAdmin() {
     if (!file) return;
     $("#upMsg").textContent = "Імпортую…";
     try {
-      const b64 = await fileToBase64(file);
-      const r = await api("upload_xlsx", { file_base64: b64 });
+      const r = await api("upload_xlsx", { sheets: await fileToGrids(file) });
       $("#upMsg").innerHTML = `<span class="ok">Готово: ${r.total} рядків, нових ${r.inserted}, змінених ${r.updated}, вилучених ${r.removed}</span>`;
       loadAdminTables();
       loadData(true);
@@ -1525,13 +1524,26 @@ function genPassword() {
   return s;
 }
 
-function fileToBase64(file) {
-  return new Promise((resolve, reject) => {
-    const r = new FileReader();
-    r.onload = () => resolve(String(r.result).split(",")[1]);
-    r.onerror = () => reject(new Error("Не вдалося прочитати файл"));
-    r.readAsDataURL(file);
+// The function runs out of CPU time parsing a large xlsx, so the browser reads it and sends rows.
+let xlsxLib;
+function loadXlsx() {
+  xlsxLib ??= new Promise((resolve, reject) => {
+    const s = document.createElement("script");
+    s.src = "vendor/xlsx.mini.min.js";
+    s.onload = () => resolve(window.XLSX);
+    s.onerror = () => { xlsxLib = null; reject(new Error("Не вдалося завантажити модуль читання Excel")); };
+    document.head.append(s);
   });
+  return xlsxLib;
+}
+
+async function fileToGrids(file) {
+  const XLSX = await loadXlsx();
+  const wb = XLSX.read(new Uint8Array(await file.arrayBuffer()), { type: "array", cellDates: true, cellHTML: false, cellText: false, cellFormula: false });
+  // Dates go as YYYY-MM-DD; SheetJS gives local midnight, so shift 12h to keep the day (same as the server).
+  const cell = (v) => v instanceof Date ? (isNaN(v) ? null : new Date(v.getTime() + 12 * 3600000).toISOString().slice(0, 10)) : v;
+  return Object.fromEntries(wb.SheetNames.map((n) => [n,
+    XLSX.utils.sheet_to_json(wb.Sheets[n], { header: 1, raw: true, defval: null }).map((r) => r.map(cell))]));
 }
 
 // ---------- boot ----------
